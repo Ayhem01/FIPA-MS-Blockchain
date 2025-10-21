@@ -1,0 +1,29 @@
+{
+  "name": "ms-backend",
+  "version": "1.0.0",
+  "description": "Node.js microservice for CRM FIPA smart contract interaction",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js",
+    "deploy": "node scripts/deploy.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": ["nodejs", "web3", "smart-contract", "ethereum", "ganache", "microservice"],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@truffle/contract": "^4.6.31",
+    "cors": "^2.8.5",
+    "dotenv": "^17.2.2",
+    "express": "^5.1.0",
+    "helmet": "^8.1.0",
+    "morgan": "^1.10.1",
+    "solc": "^0.8.30",
+    "truffle-hdwallet-provider": "^1.0.17",
+    "web3": "^4.16.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.10"
+  }
+}
