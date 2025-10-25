@@ -331,6 +331,126 @@ class Web3Service {
     isConnected() {
         return this.web3 !== null && this.web3.currentProvider.connected;
     }
+      decodeTxInput(inputHex) {
+        try {
+            if (!inputHex || inputHex === '0x') return null;
+            if (!this.web3) throw new Error('Web3 not initialized');
+            if (!this.abi) return null;
+
+            const sig = inputHex.slice(0, 10);
+            const abiFns = this.abi.filter(i => i.type === 'function');
+            let matched = null;
+
+            for (const fn of abiFns) {
+                const fnSig = this.web3.eth.abi.encodeFunctionSignature(fn);
+                if (fnSig === sig) {
+                    matched = fn;
+                    break;
+                }
+            }
+            if (!matched) return { signature: sig, method: null, args: null };
+
+            const paramsHex = '0x' + inputHex.slice(10);
+            const decoded = this.web3.eth.abi.decodeParameters(matched.inputs || [], paramsHex);
+            const args = {};
+            (matched.inputs || []).forEach((inp, idx) => {
+                // web3 returns both index and named keys; we map to names
+                const val = decoded[idx];
+                args[inp.name || String(idx)] = typeof val === 'bigint' ? val.toString() : val;
+            });
+
+            return { signature: sig, method: matched.name, args };
+        } catch (e) {
+            return { signature: inputHex?.slice(0, 10), method: null, args: null, error: e.message };
+        }
+    }
+
+    /**
+     * Decode receipt logs against current ABI, filtered to contract address if known.
+     * Returns an array of { address, event, args }.
+     */
+    decodeReceiptLogs(receipt) {
+        if (!receipt || !this.web3 || !this.abi) return [];
+        const abiEvents = this.abi.filter(x => x.type === 'event');
+        const topicToEvent = new Map();
+        for (const evt of abiEvents) {
+            topicToEvent.set(this.web3.eth.abi.encodeEventSignature(evt), evt);
+        }
+        const targetAddr = (this.contractAddress || receipt.to || '').toLowerCase();
+
+        const out = [];
+        for (const log of receipt.logs || []) {
+            if (!log.topics || log.topics.length === 0) continue;
+            // Si on a l’adresse du contrat, filtrer
+            if (targetAddr && log.address?.toLowerCase() !== targetAddr) continue;
+
+            const evtAbi = topicToEvent.get(log.topics[0]);
+            if (!evtAbi) continue;
+
+            try {
+                const args = this.web3.eth.abi.decodeLog(evtAbi.inputs || [], log.data, (log.topics || []).slice(1));
+                // Nettoyage BigInt -> string
+                Object.keys(args).forEach(k => {
+                    const v = args[k];
+                    if (typeof v === 'bigint') args[k] = v.toString();
+                });
+                out.push({ address: log.address, event: evtAbi.name, args });
+            } catch (_e) {
+                out.push({ address: log.address, event: null, args: null });
+            }
+        }
+        return out;
+    }
+
+    /**
+     * Full analysis for a transaction hash:
+     * - raw tx and receipt
+     * - decoded input and decoded events
+     */
+    async analyzeTransaction(txHash) {
+        if (!this.web3) await this.initialize();
+        if (!this.abi) {
+            try { await this.loadContract(); } catch { /* continue without ABI */ }
+        }
+
+        const tx = await this.web3.eth.getTransaction(txHash);
+        if (!tx) throw new Error('Transaction not found');
+
+        const receipt = await this.web3.eth.getTransactionReceipt(txHash);
+
+        const decodedInput = this.decodeTxInput(tx.input);
+        const decodedEvents = receipt ? this.decodeReceiptLogs(receipt) : [];
+
+        // Sanitize numeric values for JSON
+        const txOut = {
+            hash: tx.hash,
+            from: tx.from,
+            to: tx.to,
+            nonce: Number(tx.nonce),
+            gas: Number(tx.gas),
+            gasPrice: tx.gasPrice?.toString?.() ?? String(tx.gasPrice),
+            value: tx.value?.toString?.() ?? String(tx.value),
+            input: tx.input,
+            blockHash: tx.blockHash,
+            blockNumber: tx.blockNumber != null ? Number(tx.blockNumber) : null,
+        };
+
+        const receiptOut = receipt ? {
+            status: !!(receipt.status === true || receipt.status === '0x1' || receipt.status === 1),
+            blockNumber: Number(receipt.blockNumber),
+            gasUsed: Number(receipt.gasUsed),
+            contractAddress: receipt.contractAddress || null,
+            to: receipt.to || null,
+            from: receipt.from || null,
+            logs: (receipt.logs || []).map(l => ({
+                address: l.address,
+                topics: l.topics,
+                data: l.data
+            })),
+        } : null;
+
+        return { tx: txOut, receipt: receiptOut, decodedInput, decodedEvents };
+    }
 }
 
 module.exports = new Web3Service();

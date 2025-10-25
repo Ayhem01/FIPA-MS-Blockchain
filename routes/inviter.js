@@ -19,6 +19,7 @@ router.all('/ping', (_req, res) => {
   res.json({ success: true, route: 'inviter', ping: 'ok' });
 });
 
+
 // Diagnostics
 router.get('/', (_req, res) => {
   res.json({

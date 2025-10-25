@@ -9,6 +9,8 @@ const web3Service = require('./services/web3Service');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+app.set('json replacer', (_k, v) => (typeof v === 'bigint' ? v.toString() : v));
+app.set('json spaces', process.env.NODE_ENV === 'development' ? 2 : 0);
 
 /* ---------------- Middleware Globaux ---------------- */
 app.use(helmet());
@@ -25,6 +27,8 @@ app.use(cors({
 app.use(morgan(process.env.NODE_ENV === 'development' ? 'dev' : 'combined'));
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
+app.use('/api/tx', require('./routes/hash'));
+
 
 /* ---------------- Routes de diagnostic ---------------- */
 app.get('/health', (_req, res) => {
@@ -61,6 +65,7 @@ safeMount('/api/inviter', './routes/inviter');
 safeMount('/api/prospect', './routes/prospect');
 safeMount('/api/task', './routes/task');
 safeMount('/api/deploy', './routes/deploy');
+safeMount('/api/hash', './routes/hash');
 
 /* ---------------- Introspection dynamique ---------------- */
 app.get('/__routes', (req, res) => {
