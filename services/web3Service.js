@@ -10,8 +10,8 @@ class Web3Service {
         this.contractAddress = process.env.CONTRACT_ADDRESS;
         this.ganacheUrl = process.env.GANACHE_URL || 'http://127.0.0.1:7545';
         this.networkId = process.env.NETWORK_ID || '5777';
-        // Reduced gas limit to work with Ganache default settings
-        this.gasLimit = process.env.GAS_LIMIT || 6000000;
+        // Increased gas limit to handle complex contract
+        this.gasLimit = process.env.GAS_LIMIT || 8000000;
         // Much lower gas price for Ganache compatibility (20 gwei instead of 3000 gwei)
         this.gasPrice =  '20000000000'; // 20 gwei
     }
@@ -143,7 +143,7 @@ class Web3Service {
             });
 
             // Estimate gas for deployment
-            let estimatedGas;
+            let estimatedGas = this.gasLimit; // Default fallback
             try {
                 estimatedGas = await deployment.estimateGas({
                     from: account.address
@@ -151,20 +151,20 @@ class Web3Service {
                 console.log('⛽ Estimated gas:', estimatedGas);
                 
                 // Convert BigInt to number if needed and add 20% buffer
-                //estimatedGas = Number(estimatedGas);
-                //estimatedGas = Math.floor(estimatedGas * 1.2);
+                estimatedGas = Number(estimatedGas);
+                estimatedGas = Math.floor(estimatedGas * 1.2);
             } catch (gasError) {
                 console.log('⚠️ Gas estimation failed, using default:', gasError.message);
-                //estimatedGas = Number(this.gasLimit);
+                estimatedGas = Number(this.gasLimit);
             }
 
             // Use the smaller of estimated gas or our limit
-            const gasToUse = estimatedGas;
+            const gasToUse = Math.min(estimatedGas, Number(this.gasLimit));
             console.log('⛽ Gas to use for deployment:', gasToUse);
 
             const deploymentOptions = {
                 from: account.address,
-                gas: estimatedGas.toString(),
+                gas: gasToUse.toString(),
                 gasPrice: gasPrice.toString()
             };
 
@@ -189,9 +189,11 @@ class Web3Service {
             if (error.message.includes('invalid opcode')) {
                 throw new Error('Contract deployment failed: Invalid opcode - check contract code and compiler version compatibility');
             } else if (error.message.includes('out of gas')) {
-                throw new Error('Contract deployment failed: Out of gas - try increasing gas limit');
+                throw new Error('Contract deployment failed: Out of gas - the contract bytecode is too large or constructor execution is complex. Try: 1) Optimize contract, 2) Increase GANACHE server gas limit, 3) Split contract into smaller contracts');
             } else if (error.message.includes('insufficient funds')) {
                 throw new Error('Contract deployment failed: Insufficient funds in deployer account');
+            } else if (error.message.includes('Cannot read properties of undefined')) {
+                throw new Error('Contract deployment failed: Gas estimation failed and no fallback available. Check contract syntax and Ganache connection.');
             }
             
             throw error;

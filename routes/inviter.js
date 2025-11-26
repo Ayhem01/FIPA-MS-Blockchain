@@ -2,11 +2,11 @@ const express = require('express');
 const router = express.Router();
 const web3Service = require('../services/web3Service');
 
-// Security: require API key for non-GET requests (optional but recommended)
+// Security: API key for non-GET requests
 router.use((req, res, next) => {
   if (req.method === 'GET') return next();
   const expected = process.env.API_KEY;
-  if (!expected) return next(); // no API key configured -> skip
+  if (!expected) return next(); // skip if not configured
   const provided = req.headers['x-api-key'] || req.query.apiKey;
   if (provided !== expected) {
     return res.status(401).json({ success: false, error: 'Unauthorized: invalid API key' });
@@ -14,11 +14,73 @@ router.use((req, res, next) => {
   next();
 });
 
-// Ping (accept all verbs)
+// Helpers
+const toUint = (v) => {
+  const n = Number(v);
+  if (!Number.isFinite(n) || n < 0) return null;
+  return Math.trunc(n);
+};
+const mapInviterStatus = (input) => {
+  const s = String(input).toLowerCase();
+  if (s === '0' || s === 'pending') return 0;
+  if (s === '1' || s === 'accepted') return 1;
+  if (s === '2' || s === 'rejected') return 2;
+  return null;
+};
+const statusToString = (n) => {
+  const i = Number(n);
+  return i === 1 ? 'Accepted' : i === 2 ? 'Rejected' : 'Pending';
+};
+async function ensureContractReady() {
+  if (!web3Service.web3) await web3Service.initialize();
+  if (!web3Service.contract) await web3Service.loadContract();
+}
+async function getAccountFromPk(pkRaw) {
+  const pk = (pkRaw || '').trim();
+  const hex = pk.startsWith('0x') ? pk : `0x${pk}`;
+  return web3Service.web3.eth.accounts.privateKeyToAccount(hex);
+}
+async function ensureOwnerAccount(account) {
+  try {
+    const owner = await web3Service.callMethod('owner', []);
+    if (String(owner).toLowerCase() !== account.address.toLowerCase()) {
+      const err = new Error('Only contract owner can call this function');
+      err.details = { contractOwner: owner, sender: account.address };
+      throw err;
+    }
+  } catch {
+    // let contract enforce onlyOwner if owner() not available
+  }
+}
+async function tryGetInviter(id) {
+  try {
+    const inv = await web3Service.callMethod('inviters', [id]);
+    if (inv && inv.invitedAt && BigInt(inv.invitedAt) > 0n) return inv;
+  } catch {}
+  return null;
+}
+// Scan a public array by index until out-of-bounds (revert) or limit reached
+async function listArrayByIndex(varName, from = 0, limit = 50) {
+  const ids = [];
+  let i = Number(from) || 0;
+  const end = i + (Number(limit) || 50);
+  for (; i < end; i++) {
+    try {
+      const id = await web3Service.callMethod(varName, [i]);
+      if (id == null) break;
+      // Some chains may return "0" for empty slots; keep consistent with push/pop behavior (array is packed)
+      ids.push(String(id));
+    } catch {
+      break; // out-of-bounds
+    }
+  }
+  return ids;
+}
+
+// Ping
 router.all('/ping', (_req, res) => {
   res.json({ success: true, route: 'inviter', ping: 'ok' });
 });
-
 
 // Diagnostics
 router.get('/', (_req, res) => {
@@ -26,15 +88,17 @@ router.get('/', (_req, res) => {
     success: true,
     route: 'inviter',
     endpoints: [
-      'GET/POST /api/inviter/ping',
       'POST     /api/inviter/add',
-      'GET      /api/inviter/pending/all',
-      'GET      /api/inviter/accepted/all',
-      'GET      /api/inviter/:inviterId/status',
+      'POST     /api/inviter/:inviterId/send',
+      'PUT      /api/inviter/:inviterId',
+      'DELETE   /api/inviter/:inviterId',
       'POST     /api/inviter/:inviterId/accept',
       'POST     /api/inviter/:inviterId/reject',
       'POST     /api/inviter/:inviterId/convert',
-      'GET      /api/inviter/:inviterId'
+      'GET      /api/inviter/:inviterId/status',
+      'GET      /api/inviter/:inviterId',
+      'POST     /api/inviter/:inviterId/convert'
+
     ]
   });
 });
@@ -44,221 +108,355 @@ router.get('/add', (_req, res) => {
   res.status(405).json({ success: false, error: 'Use POST /api/inviter/add' });
 });
 
-// Add inviter (owner only) - uses body.privateKey or DEPLOYER_PRIVATE_KEY
+// Add inviter (onlyOwner)
 router.post('/add', async (req, res) => {
   try {
-    const { inviterId } = req.body;
-    const privateKey = (req.body.privateKey || process.env.DEPLOYER_PRIVATE_KEY || '').trim();
+    const {
+      nom = '',
+      prenom = '',
+      email = '',
+      telephone = '',
+      privateKey
+    } = req.body || {};
 
-    if (inviterId === undefined || inviterId === null) {
-      return res.status(400).json({ success: false, error: 'inviterId is required' });
-    }
-    if (!privateKey) {
-      return res.status(400).json({ success: false, error: 'Missing privateKey and DEPLOYER_PRIVATE_KEY' });
-    }
+    const pk = (privateKey || process.env.DEPLOYER_PRIVATE_KEY || '').trim();
 
-    const idNum = Number(typeof inviterId === 'string' ? inviterId.trim() : inviterId);
-    if (!Number.isFinite(idNum) || idNum < 0) {
-      return res.status(400).json({ success: false, error: 'inviterId must be a positive integer' });
-    }
+    if (!nom) return res.status(400).json({ success: false, error: 'nom is required' });
+    if (!prenom) return res.status(400).json({ success: false, error: 'prenom is required' });
+    if (!email) return res.status(400).json({ success: false, error: 'email is required' });
+    if (!telephone) return res.status(400).json({ success: false, error: 'telephone is required' });
+    if (!pk) return res.status(400).json({ success: false, error: 'privateKey is required' });
 
-    if (!web3Service.web3) await web3Service.initialize();
-    if (!web3Service.contract) {
-      return res.status(500).json({ success: false, error: 'Contract not loaded. Please deploy or load a contract first.' });
-    }
+    await ensureContractReady();
+    const account = await getAccountFromPk(pk);
+    await ensureOwnerAccount(account);
 
-    // Verify owner
-    let contractOwner;
+    // Simulation
     try {
-      contractOwner = await web3Service.callMethod('owner', []);
-    } catch {
-      return res.status(500).json({ success: false, error: 'Failed to verify contract owner.' });
+      await web3Service.contract.methods
+        .addInviter(nom, prenom, email, telephone)
+        .call({ from: account.address });
+    } catch (e) {
+      return res.status(400).json({
+        success: false,
+        error: `Revert (simulation): ${e?.message || 'call failed'}`
+      });
     }
 
-    const account = web3Service.web3.eth.accounts.privateKeyToAccount(
-      privateKey.startsWith('0x') ? privateKey : '0x' + privateKey
+    const receipt = await web3Service.sendTransaction(
+      'addInviter',
+      [nom, prenom, email, telephone],
+      null,
+      pk
     );
-    if (account.address.toLowerCase() !== contractOwner.toLowerCase()) {
-      return res.status(403).json({
-        success: false,
-        error: `Only contract owner can add inviters. Contract owner: ${contractOwner}, Your address: ${account.address}`
-      });
+
+    let inviterId;
+    if (receipt.events?.InviterCreated?.returnValues?.id) {
+      inviterId = receipt.events.InviterCreated.returnValues.id.toString();
     }
 
-    // Pre-check existence
-    try {
-      const existing = await web3Service.callMethod('inviters', [idNum]);
-      if (existing?.invitedAt && BigInt(existing.invitedAt) > 0n) {
-        return res.status(400).json({ success: false, error: `Inviter ${idNum} already exists` });
-      }
-    } catch {}
-
-    // Send transaction
-    const receipt = await web3Service.sendTransaction('addInviter', [idNum], null, privateKey);
-
-    // Verify by state
-    let addedInviter;
-    let verified = false;
-    try {
-      addedInviter = await web3Service.callMethod('inviters', [idNum]);
-      verified = !!(addedInviter && addedInviter.invitedAt && BigInt(addedInviter.invitedAt) > 0n);
-    } catch {}
-
-    if (!receipt.status || !verified) {
-      return res.status(500).json({
-        success: false,
-        error: 'Transaction mined but state change not verified',
-        data: {
-          transactionHash: receipt.transactionHash,
-          blockNumber: String(receipt.blockNumber),
-          contractAddress: receipt.to || web3Service.getContractAddress?.()
-        }
-      });
-    }
-
-    return res.json({
+    res.json({
       success: true,
       data: {
-        inviterId: idNum,
+        inviterId,
         transactionHash: receipt.transactionHash,
-        blockNumber: String(receipt.blockNumber),
-        contractAddress: receipt.to || web3Service.getContractAddress?.(),
-        inviterStatus: addedInviter?.status?.toString?.() ?? '0',
-        invitedAt: addedInviter?.invitedAt?.toString?.() ?? ''
+        blockNumber: String(receipt.blockNumber)
       }
     });
   } catch (error) {
-    console.error('Add inviter error:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
-// Lists first (to avoid capture by "/:inviterId")
-router.get('/pending/all', async (_req, res) => {
+// Send invitation (onlyOwner)
+router.post('/:inviterId/send', async (req, res) => {
   try {
-    const pendingIds = await web3Service.callMethod('getAllPendingInviterIds', []);
-    const inviters = [];
-    for (const id of pendingIds) {
-      try {
-        const inv = await web3Service.callMethod('inviters', [id]);
-        inviters.push({
-          id: inv.id, status: inv.status, invitedAt: inv.invitedAt,
-          respondedAt: inv.respondedAt, isConvertedToProspect: inv.isConvertedToProspect,
-          prospectId: inv.prospectId
-        });
-      } catch (err) {
-        console.error(`Error fetching inviter ${id}:`, err.message);
-      }
+    const idNum = toUint(req.params.inviterId);
+    const pk = (req.body?.privateKey || process.env.DEPLOYER_PRIVATE_KEY || '').trim();
+    if (idNum === null) return res.status(400).json({ success: false, error: 'inviterId must be numeric' });
+    if (!pk) return res.status(400).json({ success: false, error: 'privateKey is required' });
+
+    await ensureContractReady();
+    const account = await getAccountFromPk(pk);
+    await ensureOwnerAccount(account);
+
+    const inv = await tryGetInviter(idNum);
+    if (!inv) return res.status(404).json({ success: false, error: 'Inviter not found' });
+
+    try {
+      await web3Service.contract.methods.sendInvitation(idNum).call({ from: account.address });
+    } catch (e) {
+      return res.status(400).json({ success: false, error: `Revert (simulation): ${e?.message || 'call failed'}` });
     }
-    res.json({ success: true, data: { count: inviters.length, inviters } });
+
+    const receipt = await web3Service.sendTransaction('sendInvitation', [idNum], null, pk);
+    res.json({ success: true, data: { inviterId: String(idNum), transactionHash: receipt.transactionHash, blockNumber: String(receipt.blockNumber) } });
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, error: error.message, details: error.details || undefined });
   }
 });
 
-router.get('/accepted/all', async (_req, res) => {
+// Update inviter (onlyOwner)
+router.put('/:inviterId', async (req, res) => {
   try {
-    const acceptedIds = await web3Service.callMethod('getAllAcceptedInviterIds', []);
-    const inviters = [];
-    for (const id of acceptedIds) {
-      try {
-        const inv = await web3Service.callMethod('inviters', [id]);
-        inviters.push({
-          id: inv.id, status: inv.status, invitedAt: inv.invitedAt,
-          respondedAt: inv.respondedAt, isConvertedToProspect: inv.isConvertedToProspect,
-          prospectId: inv.prospectId
-        });
-      } catch (err) {
-        console.error(`Error fetching inviter ${id}:`, err.message);
-      }
+    const idNum = toUint(req.params.inviterId);
+    const {
+      nom = '', prenom = '', email = '', telephone = '',
+      status, privateKey
+    } = req.body || {};
+
+    const statusNum = mapInviterStatus(status);
+    const pk = (privateKey || process.env.DEPLOYER_PRIVATE_KEY || '').trim();
+
+    if (idNum === null) return res.status(400).json({ success: false, error: 'inviterId must be numeric' });
+    if (!nom) return res.status(400).json({ success: false, error: 'nom is required' });
+    if (!prenom) return res.status(400).json({ success: false, error: 'prenom is required' });
+    if (!email) return res.status(400).json({ success: false, error: 'email is required' });
+    if (!telephone) return res.status(400).json({ success: false, error: 'telephone is required' });
+    if (statusNum === null) return res.status(400).json({ success: false, error: 'status must be 0|1|2 or Pending|Accepted|Rejected' });
+    if (!pk) return res.status(400).json({ success: false, error: 'privateKey is required' });
+
+    await ensureContractReady();
+    const account = await getAccountFromPk(pk);
+    await ensureOwnerAccount(account);
+
+    const inv = await tryGetInviter(idNum);
+    if (!inv) return res.status(404).json({ success: false, error: 'Inviter not found' });
+
+    // Simulation with new signature
+    try {
+      await web3Service.contract.methods
+        .updateInviter(idNum, nom, prenom, email, telephone, statusNum)
+        .call({ from: account.address });
+    } catch (e) {
+      return res.status(400).json({ success: false, error: `Revert (simulation): ${e?.message || 'call failed'}` });
     }
-    res.json({ success: true, data: { count: inviters.length, inviters } });
+
+    const receipt = await web3Service.sendTransaction(
+      'updateInviter',
+      [idNum, nom, prenom, email, telephone, statusNum],
+      null,
+      pk
+    );
+
+    res.json({
+      success: true,
+      data: {
+        inviterId: String(idNum),
+        transactionHash: receipt.transactionHash,
+        blockNumber: String(receipt.blockNumber)
+      }
+    });
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, error: error.message, details: error.details || undefined });
   }
 });
 
-// Numeric dynamic routes only
-router.get('/:inviterId/status', async (req, res) => {
+// Delete inviter (onlyOwner)
+router.delete('/:inviterId', async (req, res) => {
   try {
-    const { inviterId } = req.params;
-    const statusString = await web3Service.callMethod('getInviterStatusString', [inviterId]);
-    const isPending = await web3Service.callMethod('isInviterPending', [inviterId]);
-    const isAccepted = await web3Service.callMethod('isInviterAccepted', [inviterId]);
-    const isRejected = await web3Service.callMethod('isInviterRejected', [inviterId]);
-    res.json({ success: true, data: { inviterId, statusString, isPending, isAccepted, isRejected } });
+    const idNum = toUint(req.params.inviterId);
+    const pk = (req.body?.privateKey || process.env.DEPLOYER_PRIVATE_KEY || '').trim();
+    if (idNum === null) return res.status(400).json({ success: false, error: 'inviterId must be numeric' });
+    if (!pk) return res.status(400).json({ success: false, error: 'privateKey is required' });
+
+    await ensureContractReady();
+    const account = await getAccountFromPk(pk);
+    await ensureOwnerAccount(account);
+
+    const inv = await tryGetInviter(idNum);
+    if (!inv) return res.status(404).json({ success: false, error: 'Inviter not found' });
+
+    try {
+      await web3Service.contract.methods.deleteInviter(idNum).call({ from: account.address });
+    } catch (e) {
+      return res.status(400).json({ success: false, error: `Revert (simulation): ${e?.message || 'call failed'}` });
+    }
+
+    const receipt = await web3Service.sendTransaction('deleteInviter', [idNum], null, pk);
+    res.json({ success: true, data: { inviterId: String(idNum), transactionHash: receipt.transactionHash, blockNumber: String(receipt.blockNumber) } });
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, error: error.message, details: error.details || undefined });
   }
 });
 
+// Accept invitation (public)
 router.post('/:inviterId/accept', async (req, res) => {
   try {
-    const { inviterId } = req.params;
-    const privateKey = (req.body.privateKey || process.env.DEPLOYER_PRIVATE_KEY || '').trim();
-    if (!privateKey) return res.status(400).json({ success: false, error: 'Missing privateKey and DEPLOYER_PRIVATE_KEY' });
+    const idNum = toUint(req.params.inviterId);
+    const pk = (req.body?.privateKey || process.env.DEPLOYER_PRIVATE_KEY || '').trim();
+    if (idNum === null) return res.status(400).json({ success: false, error: 'inviterId must be numeric' });
+    if (!pk) return res.status(400).json({ success: false, error: 'privateKey is required' });
 
-    const result = await web3Service.sendTransaction('acceptInvitation', [inviterId], null, privateKey);
-    res.json({
-      success: true,
-      data: { inviterId, transactionHash: result.transactionHash, blockNumber: result.blockNumber, gasUsed: result.gasUsed }
-    });
+    await ensureContractReady();
+    const account = await getAccountFromPk(pk);
+
+    const inv = await tryGetInviter(idNum);
+    if (!inv) return res.status(404).json({ success: false, error: 'Inviter not found' });
+
+    try {
+      await web3Service.contract.methods.acceptInvitation(idNum).call({ from: account.address });
+    } catch (e) {
+      return res.status(400).json({ success: false, error: `Revert (simulation): ${e?.message || 'call failed'}` });
+    }
+
+    const receipt = await web3Service.sendTransaction('acceptInvitation', [idNum], null, pk);
+    res.json({ success: true, data: { inviterId: String(idNum), transactionHash: receipt.transactionHash, blockNumber: String(receipt.blockNumber) } });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
+// Reject invitation (public)
 router.post('/:inviterId/reject', async (req, res) => {
   try {
-    const { inviterId } = req.params;
-    const privateKey = (req.body.privateKey || process.env.DEPLOYER_PRIVATE_KEY || '').trim();
-    if (!privateKey) return res.status(400).json({ success: false, error: 'Missing privateKey and DEPLOYER_PRIVATE_KEY' });
+    const idNum = toUint(req.params.inviterId);
+    const pk = (req.body?.privateKey || process.env.DEPLOYER_PRIVATE_KEY || '').trim();
+    if (idNum === null) return res.status(400).json({ success: false, error: 'inviterId must be numeric' });
+    if (!pk) return res.status(400).json({ success: false, error: 'privateKey is required' });
 
-    const result = await web3Service.sendTransaction('rejectInvitation', [inviterId], null, privateKey);
-    res.json({
-      success: true,
-      data: { inviterId, transactionHash: result.transactionHash, blockNumber: result.blockNumber, gasUsed: result.gasUsed }
-    });
+    await ensureContractReady();
+    const account = await getAccountFromPk(pk);
+
+    const inv = await tryGetInviter(idNum);
+    if (!inv) return res.status(404).json({ success: false, error: 'Inviter not found' });
+
+    try {
+      await web3Service.contract.methods.rejectInvitation(idNum).call({ from: account.address });
+    } catch (e) {
+      return res.status(400).json({ success: false, error: `Revert (simulation): ${e?.message || 'call failed'}` });
+    }
+
+    const receipt = await web3Service.sendTransaction('rejectInvitation', [idNum], null, pk);
+    res.json({ success: true, data: { inviterId: String(idNum), transactionHash: receipt.transactionHash, blockNumber: String(receipt.blockNumber) } });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
 });
+
 
 router.post('/:inviterId/convert', async (req, res) => {
   try {
-    const { inviterId } = req.params;
-    const { name, responsiblePerson } = req.body;
-    const privateKey = (req.body.privateKey || process.env.DEPLOYER_PRIVATE_KEY || '').trim();
+    const idNum = toUint(req.params.inviterId);
+    const {
+      nom = '',
+      adresse = '',
+      valeurPotentielle,
+      valeur_potentielle,
+      notesInternes = '',
+      notes_internes = '',
+      privateKey
+    } = req.body || {};
 
-    if (!name || !responsiblePerson) {
-      return res.status(400).json({ success: false, error: 'name and responsiblePerson are required' });
+    const pk = (privateKey || process.env.DEPLOYER_PRIVATE_KEY || '').trim();
+    if (idNum === null) return res.status(400).json({ success: false, error: 'inviterId must be numeric' });
+    if (!pk) return res.status(400).json({ success: false, error: 'privateKey is required' });
+
+    const valeur = toUint(valeurPotentielle ?? valeur_potentielle ?? 0);
+    if (valeur === null) return res.status(400).json({ success: false, error: 'valeurPotentielle invalide' });
+
+    await ensureContractReady();
+    const account = await getAccountFromPk(pk);
+    await ensureOwnerAccount(account);
+
+    const inv = await tryGetInviter(idNum);
+    if (!inv) return res.status(404).json({ success: false, error: 'Inviter not found' });
+    if (inv.converted) return res.status(400).json({ success: false, error: 'Already converted' });
+
+    // Simulation
+    try {
+      await web3Service.contract.methods
+        .convertInviterToProspect(idNum, nom, adresse, valeur, notesInternes || notes_internes)
+        .call({ from: account.address });
+    } catch (e) {
+      return res.status(400).json({
+        success: false,
+        error: `Revert (simulation): ${e?.data?.reason || e?.message || 'call failed'}`
+      });
     }
-    if (!privateKey) return res.status(400).json({ success: false, error: 'Missing privateKey and DEPLOYER_PRIVATE_KEY' });
 
-    const result = await web3Service.sendTransaction('convertInviterToProspect', [inviterId, name, responsiblePerson], null, privateKey);
+    const receipt = await web3Service.sendTransaction(
+      'convertInviterToProspect',
+      [idNum, nom, adresse, valeur, notesInternes || notes_internes],
+      null,
+      pk
+    );
+
+    let prospectId = null;
+    if (receipt.events?.ProspectCreated?.returnValues?.id) {
+      prospectId = receipt.events.ProspectCreated.returnValues.id.toString();
+    } else if (receipt.events?.InviterConverted?.returnValues?.prospectId) {
+      prospectId = receipt.events.InviterConverted.returnValues.prospectId.toString();
+    } else if (receipt.events?.InviterConverted?.returnValues?.['1']) {
+      prospectId = receipt.events.InviterConverted.returnValues['1'].toString();
+    }
+
     res.json({
       success: true,
-      data: { inviterId, transactionHash: result.transactionHash, blockNumber: result.blockNumber, gasUsed: result.gasUsed }
+      data: {
+        inviterId: String(idNum),
+        prospectId,
+        transactionHash: receipt.transactionHash,
+        blockNumber: String(receipt.blockNumber)
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message, details: error.details || undefined });
+  }
+});
+
+
+router.get('/:inviterId/status', async (req, res) => {
+  try {
+    const idNum = toUint(req.params.inviterId);
+    if (idNum === null) return res.status(400).json({ success: false, error: 'inviterId must be numeric' });
+    await ensureContractReady();
+
+    const inv = await tryGetInviter(idNum);
+    if (!inv) return res.status(404).json({ success: false, error: 'Inviter not found' });
+
+    const statusNum = inv.status?.toString?.() ?? '0';
+    res.json({
+      success: true,
+      data: {
+        inviterId: String(idNum),
+        status: statusNum,
+        statusLabel: statusToString(statusNum),
+        invitedAt: inv.invitedAt?.toString?.() ?? '',
+        respondedAt: inv.respondedAt?.toString?.() ?? ''
+      }
     });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
-// Generic - keep last and numeric only
+// Get inviter (struct)
 router.get('/:inviterId', async (req, res) => {
   try {
-    const { inviterId } = req.params;
-    const inviter = await web3Service.callMethod('inviters', [inviterId]);
+    const idNum = toUint(req.params.inviterId);
+    if (idNum === null) return res.status(400).json({ success: false, error: 'inviterId must be numeric' });
+
+    await ensureContractReady();
+    const inv = await tryGetInviter(idNum);
+    if (!inv) return res.status(404).json({ success: false, error: 'Inviter not found' });
+
     res.json({
       success: true,
       data: {
-        id: inviter.id?.toString?.() ?? String(inviterId),
-        status: inviter.status?.toString?.() ?? '',
-        invitedAt: inviter.invitedAt?.toString?.() ?? '',
-        respondedAt: inviter.respondedAt?.toString?.() ?? '',
-        isConvertedToProspect: !!inviter.isConvertedToProspect,
-        prospectId: inviter.prospectId?.toString?.() ?? '0'
+        id: inv.id?.toString?.() ?? String(idNum),
+        status: inv.status?.toString?.() ?? '0',
+        statusLabel: statusToString(inv.status),
+        invitedAt: inv.invitedAt?.toString?.() ?? '',
+        respondedAt: inv.respondedAt?.toString?.() ?? '',
+        isConvertedToProspect: !!inv.isConvertedToProspect,
+        prospectId: inv.prospectId?.toString?.() ?? '0',
+        nom: inv.nom,
+        prenom: inv.prenom,
+        email: inv.email,
+        telephone: inv.telephone,
+        pays_id: inv.pays_id?.toString?.() ?? '0',
+        secteur_id: inv.secteur_id?.toString?.() ?? '0'
       }
     });
   } catch (error) {

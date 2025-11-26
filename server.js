@@ -66,6 +66,10 @@ safeMount('/api/prospect', './routes/prospect');
 safeMount('/api/task', './routes/task');
 safeMount('/api/deploy', './routes/deploy');
 safeMount('/api/hash', './routes/hash');
+safeMount('/api/investisseur', './routes/investisseur');
+safeMount('/api/projet', './routes/projet');
+safeMount('/api/action', './routes/action');
+safeMount('/api/blocage', './routes/blocage');
 
 /* ---------------- Introspection dynamique ---------------- */
 app.get('/__routes', (req, res) => {
@@ -113,7 +117,6 @@ async function start() {
     await web3Service.initialize();
     app.listen(PORT, () => {
       console.log(`🚀 CRM FIPA Microservice running on http://localhost:${PORT}`);
-      console.log(`📊 Health check: http://localhost:${PORT}/health`);
     });
   } catch (e) {
     console.error('❌ Failed to start server:', e.message);

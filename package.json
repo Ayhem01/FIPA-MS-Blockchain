@@ -7,7 +7,9 @@
     "start": "node server.js",
     "dev": "nodemon server.js",
     "deploy": "node scripts/deploy.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 1",
+  "compile": "npx solcjs --bin --abi --optimize --include-path node_modules/ --base-path . -o build contracts/crmfipa.sol"
+
   },
   "keywords": ["nodejs", "web3", "smart-contract", "ethereum", "ganache", "microservice"],
   "author": "",
